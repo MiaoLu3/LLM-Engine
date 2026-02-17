@@ -231,6 +231,11 @@ class Qwen3Model(nn.Module):
             self.config.rope_theta,
         )
 
+        # Cast to match hidden states dtype (RoPE is computed in float32 for
+        # precision, but must match model dtype for downstream ops)
+        cos = cos.to(hidden_states.dtype)
+        sin = sin.to(hidden_states.dtype)
+
         # For packed sequences, squeeze the batch dimension
         if position_ids.dim() == 1:
             cos = cos.squeeze(0)  # [total_tokens, head_dim]

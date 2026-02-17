@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from llm_engine.model.layers import RMSNorm
 from llm_engine.model.rope import apply_rope_to_qk
 
 
@@ -273,9 +274,9 @@ class Qwen3Attention(nn.Module):
             num_attention_heads * head_dim, hidden_size, bias=False
         )
 
-        # Optional: Q/K layer norms (Qwen3 may or may not use these)
-        self.q_norm: Optional[nn.Module] = None
-        self.k_norm: Optional[nn.Module] = None
+        # Q/K layer norms (Qwen3 uses RMSNorm on Q/K projections)
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
 
     def forward(
         self,
@@ -360,6 +361,10 @@ class Qwen3Attention(nn.Module):
             k = k.view(total_tokens, self.num_kv_heads, self.head_dim)
             v = v.view(total_tokens, self.num_kv_heads, self.head_dim)
 
+            # Apply QK-norm before RoPE
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
             # Apply RoPE
             # For packed sequences, cos/sin should be [total_tokens, head_dim]
             # We need to apply RoPE per-token
@@ -392,6 +397,10 @@ class Qwen3Attention(nn.Module):
             k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
             v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
+            # Apply QK-norm before RoPE
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
             # Transpose to [batch, num_heads, seq_len, head_dim]
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -400,8 +409,22 @@ class Qwen3Attention(nn.Module):
             # Apply RoPE
             q, k = apply_rope_to_qk(q, k, cos, sin)
 
-            # Use naive attention for padded batches (or could use FlashAttention)
-            output = naive_attention(q, k, v, causal=True)
+            # Expand KV heads for GQA before attention
+            # Use expand+reshape to match HF's repeat_kv memory layout
+            if self.num_heads != self.num_kv_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k = k[:, :, None, :, :].expand(
+                    batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
+                ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+                v = v[:, :, None, :, :].expand(
+                    batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
+                ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+
+            # Use PyTorch SDPA (matches HuggingFace attention backend)
+            # Only set is_causal=True for seq_len > 1 (matching HF behavior)
+            output = F.scaled_dot_product_attention(
+                q, k, v, is_causal=(seq_len > 1),
+            )
 
             # Reshape output: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, hidden_size]
             output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
@@ -451,6 +474,10 @@ class Qwen3Attention(nn.Module):
         q = q.view(batch_size, self.num_heads, self.head_dim)
         k = k.view(batch_size, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, self.num_kv_heads, self.head_dim)
+
+        # Apply QK-norm before RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE to Q and K
         # cos, sin should be [batch, 1, head_dim] or [batch, head_dim]
