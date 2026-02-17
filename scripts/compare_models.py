@@ -177,11 +177,8 @@ def compare_token_by_token(
             hf_out = hf_model(partial_ids)
             hf_logits = hf_out.logits
 
-            # Custom forward (prefill mode, no packed sequences)
-            custom_logits, _ = custom_model(
-                partial_ids,
-                is_prefill=True,
-            )
+            # Custom forward (legacy mode for HF comparison)
+            custom_logits = custom_model.forward_legacy(partial_ids)
 
         # Compare
         result = compare_logits(hf_logits, custom_logits, atol, rtol)
@@ -248,12 +245,9 @@ def main():
         hf_logits = hf_out.logits
         hf_hidden = hf_out.hidden_states[-1]  # Last layer hidden states
 
-        # Custom forward
+        # Custom forward (legacy mode for HF comparison)
         print("Running custom forward...")
-        custom_logits, kv_list = custom_model(
-            input_ids,
-            is_prefill=True,
-        )
+        custom_logits = custom_model.forward_legacy(input_ids)
 
     # Compare logits
     print("\nLogits Comparison:")

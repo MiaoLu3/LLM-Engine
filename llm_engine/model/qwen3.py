@@ -4,11 +4,11 @@ Full Qwen3 model implementation.
 This module provides a complete Qwen3 model that:
 1. Defines all components from scratch (using our custom layers)
 2. Loads weights from HuggingFace checkpoints
-3. Supports both prefill (FlashAttention) and decode (PagedAttention) modes
+3. Supports unified forward (Option C) for prefill, chunked prefill, and decode
 
 Architecture (Qwen3-4B example):
 - embed_tokens: [vocab_size=151936, hidden_size=2560]
-- 40 decoder layers with GQA (num_heads=20, num_kv_heads=4)
+- 36 decoder layers with GQA (num_heads=20, num_kv_heads=4)
 - RoPE with theta=1000000
 - SwiGLU MLP with intermediate_size=6912
 - Final RMSNorm + lm_head
@@ -18,7 +18,7 @@ Reference:
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, TYPE_CHECKING
 import json
 from pathlib import Path
 
@@ -30,6 +30,9 @@ from llm_engine.model.layers import RMSNorm, Qwen3MLP
 from llm_engine.model.attention import Qwen3Attention
 from llm_engine.model.rope import compute_rope_cos_sin, RotaryEmbedding
 
+if TYPE_CHECKING:
+    from llm_engine.model.attention_metadata import AttentionMetadata
+
 
 @dataclass
 class Qwen3Config:
@@ -38,7 +41,7 @@ class Qwen3Config:
     vocab_size: int = 151936
     hidden_size: int = 2560
     intermediate_size: int = 6912
-    num_hidden_layers: int = 40
+    num_hidden_layers: int = 36
     num_attention_heads: int = 20
     num_key_value_heads: int = 4
     head_dim: int = 128
@@ -58,7 +61,7 @@ class Qwen3Config:
             vocab_size=config_dict.get("vocab_size", 151936),
             hidden_size=config_dict.get("hidden_size", 2560),
             intermediate_size=config_dict.get("intermediate_size", 6912),
-            num_hidden_layers=config_dict.get("num_hidden_layers", 40),
+            num_hidden_layers=config_dict.get("num_hidden_layers", 36),
             num_attention_heads=config_dict.get("num_attention_heads", 20),
             num_key_value_heads=config_dict.get("num_key_value_heads", 4),
             head_dim=config_dict.get(
@@ -109,34 +112,30 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: Tensor,
         position_embeddings: Tuple[Tensor, Tensor],
-        is_prefill: bool = True,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        k_cache: Optional[Tensor] = None,
-        v_cache: Optional[Tensor] = None,
-        block_tables: Optional[Tensor] = None,
-        context_lens: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        kv_cache: Optional[Tuple[Tensor, Tensor]] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> Tensor:
         """
         Forward pass through decoder layer.
 
+        Args:
+            hidden_states: [total_tokens, hidden_size] or [batch, seq, hidden_size]
+            position_embeddings: (cos, sin) for RoPE
+            kv_cache: Optional (k_cache, v_cache) for this layer
+            attn_metadata: Optional metadata for unified attention
+
         Returns:
-            Tuple of (output_hidden_states, (key, value)).
+            Output hidden states
         """
         # Self-attention with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_output, kv = self.self_attn(
+        attn_output = self.self_attn(
             hidden_states,
             position_embeddings=position_embeddings,
-            is_prefill=is_prefill,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_tables=block_tables,
-            context_lens=context_lens,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
         )
 
         hidden_states = residual + attn_output
@@ -147,7 +146,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, kv
+        return hidden_states
 
 
 class Qwen3Model(nn.Module):
@@ -185,90 +184,104 @@ class Qwen3Model(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        position_ids: Optional[Tensor] = None,
-        is_prefill: bool = True,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
+        positions: Tensor,
         kv_caches: Optional[List[Tuple[Tensor, Tensor]]] = None,
-        block_tables: Optional[Tensor] = None,
-        context_lens: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, List[Tuple[Tensor, Tensor]]]:
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> Tensor:
         """
-        Forward pass through transformer.
+        Unified forward pass through transformer.
 
         Args:
-            input_ids: Token IDs [batch, seq_len] or [total_tokens] for packed.
-            position_ids: Position IDs [batch, seq_len] or [total_tokens].
-            is_prefill: Whether in prefill mode.
-            cu_seqlens: Cumulative sequence lengths for packed input.
-            max_seqlen: Maximum sequence length.
-            kv_caches: List of (k_cache, v_cache) per layer (for decode).
-            block_tables: Block tables [batch, max_blocks] (for decode).
-            context_lens: Context lengths [batch] (for decode).
+            input_ids: Token IDs [total_tokens] for packed input.
+            positions: Position IDs [total_tokens] for each token.
+            kv_caches: List of (k_cache, v_cache) per layer.
+                      Shape: [num_blocks, block_size, num_kv_heads, head_dim]
+            attn_metadata: AttentionMetadata describing batch composition.
 
         Returns:
-            Tuple of (hidden_states, new_kv_list).
+            Hidden states [total_tokens, hidden_size]
         """
         # Get embeddings
         hidden_states = self.embed_tokens(input_ids)
 
         # Compute RoPE embeddings
-        if position_ids is None:
-            if input_ids.dim() == 1:
-                # Packed: positions are implicit
-                position_ids = torch.arange(
-                    input_ids.shape[0], device=input_ids.device
-                )
-            else:
-                # Batched
-                seq_len = input_ids.shape[1]
-                position_ids = torch.arange(seq_len, device=input_ids.device)
-                position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
-
+        # positions: [total_tokens]
         cos, sin = compute_rope_cos_sin(
-            position_ids if position_ids.dim() == 2 else position_ids.unsqueeze(0),
+            positions.unsqueeze(0),  # [1, total_tokens]
             self.config.head_dim,
             self.config.rope_theta,
         )
 
-        # Cast to match hidden states dtype (RoPE is computed in float32 for
-        # precision, but must match model dtype for downstream ops)
+        # Cast to match hidden states dtype
         cos = cos.to(hidden_states.dtype)
         sin = sin.to(hidden_states.dtype)
 
-        # For packed sequences, squeeze the batch dimension
-        if position_ids.dim() == 1:
-            cos = cos.squeeze(0)  # [total_tokens, head_dim]
-            sin = sin.squeeze(0)
+        # Squeeze for packed format: [total_tokens, head_dim]
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
 
         position_embeddings = (cos, sin)
 
         # Process through layers
-        new_kv_list = []
         for i, layer in enumerate(self.layers):
-            # Get KV cache for this layer if available
-            if kv_caches is not None and i < len(kv_caches):
-                k_cache, v_cache = kv_caches[i]
-            else:
-                k_cache, v_cache = None, None
+            kv_cache = kv_caches[i] if kv_caches is not None else None
 
-            hidden_states, kv = layer(
+            hidden_states = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
-                is_prefill=is_prefill,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                block_tables=block_tables,
-                context_lens=context_lens,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
             )
-            new_kv_list.append(kv)
 
         # Final norm
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, new_kv_list
+        return hidden_states
+
+    def forward_legacy(
+        self,
+        input_ids: Tensor,
+        position_ids: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Legacy forward for HuggingFace comparison (pure prefill, no cache).
+
+        Args:
+            input_ids: [batch, seq_len] for batched input
+            position_ids: Optional [batch, seq_len]
+
+        Returns:
+            Hidden states [batch, seq_len, hidden_size]
+        """
+        hidden_states = self.embed_tokens(input_ids)
+
+        if position_ids is None:
+            seq_len = input_ids.shape[1]
+            position_ids = torch.arange(seq_len, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
+
+        cos, sin = compute_rope_cos_sin(
+            position_ids,
+            self.config.head_dim,
+            self.config.rope_theta,
+        )
+
+        cos = cos.to(hidden_states.dtype)
+        sin = sin.to(hidden_states.dtype)
+
+        position_embeddings = (cos, sin)
+
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                kv_cache=None,
+                attn_metadata=None,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -276,6 +289,7 @@ class Qwen3ForCausalLM(nn.Module):
     Qwen3 for causal language modeling.
 
     This is the full model including the lm_head for next-token prediction.
+    Supports unified forward (Option C) for prefill, chunked prefill, and decode.
     """
 
     def __init__(self, config: Qwen3Config):
@@ -295,45 +309,57 @@ class Qwen3ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        position_ids: Optional[Tensor] = None,
-        is_prefill: bool = True,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
+        positions: Tensor,
         kv_caches: Optional[List[Tuple[Tensor, Tensor]]] = None,
-        block_tables: Optional[Tensor] = None,
-        context_lens: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, List[Tuple[Tensor, Tensor]]]:
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> Tensor:
         """
-        Forward pass returning logits.
+        Unified forward pass returning logits.
 
         Args:
-            input_ids: Token IDs.
-            position_ids: Position IDs.
-            is_prefill: Whether in prefill mode.
-            cu_seqlens: Cumulative sequence lengths.
-            max_seqlen: Maximum sequence length.
-            kv_caches: KV caches per layer.
-            block_tables: Block tables for PagedAttention.
-            context_lens: Context lengths.
+            input_ids: Token IDs [total_tokens].
+            positions: Position IDs [total_tokens].
+            kv_caches: List of (k_cache, v_cache) per layer.
+            attn_metadata: AttentionMetadata describing batch composition.
 
         Returns:
-            Tuple of (logits, new_kv_list).
+            Logits [total_tokens, vocab_size]
         """
-        hidden_states, new_kv_list = self.model(
+        hidden_states = self.model(
             input_ids=input_ids,
-            position_ids=position_ids,
-            is_prefill=is_prefill,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            positions=positions,
             kv_caches=kv_caches,
-            block_tables=block_tables,
-            context_lens=context_lens,
+            attn_metadata=attn_metadata,
         )
 
         # Compute logits
         logits = self.lm_head(hidden_states)
 
-        return logits, new_kv_list
+        return logits
+
+    def forward_legacy(
+        self,
+        input_ids: Tensor,
+        position_ids: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Legacy forward for HuggingFace comparison (pure prefill, no cache).
+
+        Args:
+            input_ids: [batch, seq_len]
+            position_ids: Optional [batch, seq_len]
+
+        Returns:
+            Logits [batch, seq_len, vocab_size]
+        """
+        hidden_states = self.model.forward_legacy(
+            input_ids=input_ids,
+            position_ids=position_ids,
+        )
+
+        logits = self.lm_head(hidden_states)
+
+        return logits
 
     @classmethod
     def from_pretrained(

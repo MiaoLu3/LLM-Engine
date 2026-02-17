@@ -14,7 +14,8 @@ A minimal LLM serving engine built from scratch, implementing core vLLM concepts
 |-------|-------|--------|
 | Foundation | 1-3 | Completed |
 | Custom Model | 3.5a-f | Completed & Validated |
-| KV Cache | 4a-c | Pending |
+| Unified Attention | 3.6 | Completed (Option C) |
+| KV Cache | 4a-b | Pending |
 | Scheduling | 5-6 | Pending |
 | API & Features | 7-10 | Pending |
 | Production | 11-12 | Pending |
@@ -132,6 +133,54 @@ fp16:    bit-exact match ✓
 
 See: `docs/qwen3-hf-comparison-fixes.md` for detailed analysis.
 
+### Step 3.6: Unified Attention Architecture (Option C)
+**Status:** Completed
+
+Refactored attention to use vLLM-style unified forward pass with metadata-driven routing.
+
+**New Files:**
+
+| File | Purpose |
+|------|---------|
+| `model/attention_metadata.py` | `AttentionMetadata`, `AttentionMetadataBuilder` |
+
+**Key Changes:**
+
+1. **AttentionMetadata**: Describes batch composition (prefill vs decode tokens)
+2. **Unified forward**: Single entry point handles all modes
+3. **Split processing**: Prefill and decode tokens processed separately
+4. **KV cache integration**: `write_to_kv_cache()`, `gather_from_kv_cache()`
+
+**Token Layout:**
+```
+[<-- prefill tokens -->|<-- decode tokens -->]
+```
+
+**Forward Flow:**
+```python
+def forward(hidden_states, position_embeddings, kv_cache, attn_metadata):
+    # 1. Project all tokens together
+    q, k, v = project_qkv(hidden_states)
+
+    # 2. Write new KV to cache
+    if kv_cache and slot_mapping:
+        write_to_kv_cache(k, v, kv_cache, slot_mapping)
+
+    # 3. Split and process
+    if num_prefill > 0:
+        output[:num_prefill] = prefill_attention(q[:num_prefill], ...)
+    if num_decode > 0:
+        output[num_prefill:] = decode_attention(q[num_prefill:], ...)
+
+    return o_proj(output)
+```
+
+**Supports:**
+- Pure prefill (FlashAttention varlen)
+- Chunked prefill (SDPA with cached + new KV)
+- Decode (PagedAttention)
+- Mixed batches (prefill + decode in same forward)
+
 ---
 
 ## Phase 3: KV Cache (Next)
@@ -151,6 +200,9 @@ class KVCache:
     def __init__(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype):
         self.k_cache = [torch.zeros(...) for _ in range(num_layers)]
         self.v_cache = [torch.zeros(...) for _ in range(num_layers)]
+
+    def get_layer_cache(self, layer_idx) -> Tuple[Tensor, Tensor]:
+        return (self.k_cache[layer_idx], self.v_cache[layer_idx])
 ```
 
 ### Step 4b: BlockManager
@@ -167,18 +219,13 @@ class BlockManager:
     - Allocate blocks for new sequences
     - Free blocks when sequences complete
     - Copy-on-write for beam search / prefix sharing
+    - Compute slot_mapping for KV cache writes
     """
     def allocate(self, seq_id: int, num_blocks: int) -> List[int]
     def free(self, seq_id: int) -> None
     def fork(self, src_seq_id: int, dst_seq_id: int) -> None  # CoW
+    def get_slot_mapping(self, seq_id: int, positions: List[int]) -> List[int]
 ```
-
-### Step 4c: Integrate with Attention
-**Status:** Pending
-
-- Update `Qwen3Attention.forward()` to read/write KV cache during decode
-- Pass `KVCache` and `BlockTable` to attention layers
-- Update `paged_attention_decode()` to use actual block indices
 
 ---
 
@@ -247,11 +294,18 @@ Cache and reuse KV for common prefixes:
 ### Step 9: Chunked Prefill
 **Status:** Pending
 
-Split long prefills into chunks to interleave with decodes:
+Split long prefills into chunks to interleave with decodes.
 
-- Configurable chunk size (e.g., 512 tokens)
-- Allows decode tokens to proceed during long prefills
-- Improves latency for concurrent requests
+**Note:** The unified attention (Step 3.6) already supports chunked prefill. This step only requires:
+
+- Scheduler changes to split large prefills into chunks
+- Build `AttentionMetadata` with `prefill_context_lens > 0`
+- Configurable `max_num_batched_tokens` (default: 8192)
+
+The attention layer handles chunked prefill via `_attention_chunked_prefill()`:
+1. Gather cached KV from paged cache
+2. Concatenate with new chunk KV
+3. Apply causal attention with custom mask
 
 ### Step 10: Preemption
 **Status:** Pending
@@ -301,7 +355,8 @@ llm-engine/
 │   ├── model/
 │   │   ├── rope.py            # Rotary position embeddings
 │   │   ├── layers.py          # RMSNorm, MLP
-│   │   ├── attention.py       # Flash/Paged attention
+│   │   ├── attention.py       # Unified attention (prefill/decode)
+│   │   ├── attention_metadata.py  # AttentionMetadata for unified forward
 │   │   ├── qwen3.py           # Full Qwen3 model
 │   │   ├── loader.py          # Weight loading
 │   │   └── executor.py        # Model execution

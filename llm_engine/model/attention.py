@@ -4,15 +4,22 @@ Attention mechanisms for Qwen3.
 This module implements:
 - FlashAttention varlen for prefill (variable-length packed sequences)
 - PagedAttention for decode (block-based KV cache with PyTorch gather)
-- Qwen3Attention module combining both
+- Qwen3Attention module with unified forward (Option C architecture)
+
+The unified forward handles:
+- Pure prefill (no KV cache)
+- Chunked prefill (partial KV cache + new tokens)
+- Decode (single token, full KV cache)
+- Mixed batches (prefill + decode in same forward pass)
 
 References:
 - FlashAttention: https://arxiv.org/abs/2205.14135
 - PagedAttention: https://arxiv.org/abs/2309.06180
+- vLLM FlashInfer backend
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -21,6 +28,9 @@ from torch import Tensor
 
 from llm_engine.model.layers import RMSNorm
 from llm_engine.model.rope import apply_rope_to_qk
+
+if TYPE_CHECKING:
+    from llm_engine.model.attention_metadata import AttentionMetadata
 
 
 def flash_attention_prefill(
@@ -226,13 +236,96 @@ def naive_attention(
     return output
 
 
+def write_to_kv_cache(
+    key: Tensor,
+    value: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    slot_mapping: Tensor,
+) -> None:
+    """
+    Write K/V to cache at specified slots.
+
+    Args:
+        key: New keys [num_tokens, num_kv_heads, head_dim]
+        value: New values [num_tokens, num_kv_heads, head_dim]
+        k_cache: Key cache [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache: Value cache [num_blocks, block_size, num_kv_heads, head_dim]
+        slot_mapping: [num_tokens] - linear index into flattened cache
+    """
+    # Flatten cache for indexing: [num_blocks * block_size, num_kv_heads, head_dim]
+    num_blocks, block_size, num_kv_heads, head_dim = k_cache.shape
+    k_cache_flat = k_cache.view(-1, num_kv_heads, head_dim)
+    v_cache_flat = v_cache.view(-1, num_kv_heads, head_dim)
+
+    # Write to cache
+    k_cache_flat[slot_mapping] = key
+    v_cache_flat[slot_mapping] = value
+
+
+def gather_from_kv_cache(
+    k_cache: Tensor,
+    v_cache: Tensor,
+    block_tables: Tensor,
+    context_lens: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Gather K/V from paged cache for chunked prefill.
+
+    Args:
+        k_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        block_tables: [num_seqs, max_blocks] - block indices per sequence
+        context_lens: [num_seqs] - number of cached tokens per sequence
+
+    Returns:
+        Tuple of (k_gathered, v_gathered) with shapes:
+        [total_cached_tokens, num_kv_heads, head_dim]
+    """
+    num_seqs = block_tables.shape[0]
+    num_blocks, block_size, num_kv_heads, head_dim = k_cache.shape
+
+    gathered_k = []
+    gathered_v = []
+
+    for i in range(num_seqs):
+        ctx_len = context_lens[i].item()
+        if ctx_len == 0:
+            continue
+
+        num_full_blocks = ctx_len // block_size
+        remaining = ctx_len % block_size
+
+        # Gather full blocks
+        for b in range(num_full_blocks):
+            block_idx = block_tables[i, b].item()
+            gathered_k.append(k_cache[block_idx])  # [block_size, num_kv_heads, head_dim]
+            gathered_v.append(v_cache[block_idx])
+
+        # Gather partial block
+        if remaining > 0:
+            block_idx = block_tables[i, num_full_blocks].item()
+            gathered_k.append(k_cache[block_idx, :remaining])
+            gathered_v.append(v_cache[block_idx, :remaining])
+
+    if gathered_k:
+        return torch.cat(gathered_k, dim=0), torch.cat(gathered_v, dim=0)
+    else:
+        return (
+            torch.empty(0, num_kv_heads, head_dim, device=k_cache.device, dtype=k_cache.dtype),
+            torch.empty(0, num_kv_heads, head_dim, device=v_cache.device, dtype=v_cache.dtype),
+        )
+
+
 class Qwen3Attention(nn.Module):
     """
     Multi-head attention with Grouped Query Attention (GQA) for Qwen3.
 
-    Supports two modes:
-    - Prefill: Uses FlashAttention varlen for efficient packed attention
-    - Decode: Uses PagedAttention with block-based KV cache
+    Unified forward supporting:
+    - Pure prefill (FlashAttention varlen, no cache)
+    - Chunked prefill (SDPA with cached + new KV)
+    - Decode (PagedAttention with full cache)
+    - Mixed batches (split processing)
 
     Args:
         hidden_size: Model hidden dimension.
@@ -282,264 +375,455 @@ class Qwen3Attention(nn.Module):
         self,
         hidden_states: Tensor,
         position_embeddings: Tuple[Tensor, Tensor],
-        # For prefill mode
-        is_prefill: bool = True,
-        cu_seqlens: Optional[Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        # For decode mode
-        k_cache: Optional[Tensor] = None,
-        v_cache: Optional[Tensor] = None,
-        block_tables: Optional[Tensor] = None,
-        context_lens: Optional[Tensor] = None,
-        # Cache management
-        cache_positions: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        kv_cache: Optional[Tuple[Tensor, Tensor]] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> Tensor:
         """
-        Forward pass with support for both prefill and decode.
+        Unified forward pass handling all attention modes.
+
+        Token layout in hidden_states (when using metadata):
+            [<-- prefill tokens -->|<-- decode tokens -->]
 
         Args:
-            hidden_states: Input [batch, seq_len, hidden_size] or
-                          [total_tokens, hidden_size] for packed prefill.
+            hidden_states: [total_tokens, hidden_size] for packed input, or
+                          [batch, seq_len, hidden_size] for padded input.
             position_embeddings: Tuple of (cos, sin) for RoPE.
-            is_prefill: Whether this is prefill (True) or decode (False).
-            cu_seqlens: Cumulative sequence lengths for packed prefill.
-            max_seqlen: Maximum sequence length in batch.
-            k_cache: Key cache for decode [num_blocks, block_size, num_kv_heads, head_dim].
-            v_cache: Value cache for decode.
-            block_tables: Block indices [batch, max_blocks].
-            context_lens: Context lengths [batch].
-            cache_positions: Positions for caching new KV values.
+            kv_cache: Optional tuple of (k_cache, v_cache) for this layer.
+                     Shape: [num_blocks, block_size, num_kv_heads, head_dim]
+            attn_metadata: AttentionMetadata describing batch composition.
+                          If None, falls back to legacy pure prefill mode.
 
         Returns:
-            Tuple of:
-            - output: Attention output, same shape as input.
-            - (key, value): New KV tensors for caching.
+            Output tensor, same shape as hidden_states.
         """
         cos, sin = position_embeddings
 
-        if is_prefill:
-            return self._forward_prefill(
-                hidden_states, cos, sin, cu_seqlens, max_seqlen
-            )
-        else:
-            return self._forward_decode(
-                hidden_states, cos, sin, k_cache, v_cache, block_tables, context_lens
-            )
+        # Legacy mode: no metadata, assume pure prefill
+        if attn_metadata is None:
+            return self._forward_legacy_prefill(hidden_states, cos, sin)
 
-    def _forward_prefill(
+        # Unified mode with metadata
+        return self._forward_unified(hidden_states, cos, sin, kv_cache, attn_metadata)
+
+    def _forward_unified(
         self,
         hidden_states: Tensor,
         cos: Tensor,
         sin: Tensor,
-        cu_seqlens: Optional[Tensor],
-        max_seqlen: Optional[int],
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        kv_cache: Optional[Tuple[Tensor, Tensor]],
+        attn_metadata: "AttentionMetadata",
+    ) -> Tensor:
         """
-        Prefill forward using FlashAttention.
+        Unified forward with metadata-driven routing.
 
-        Args:
-            hidden_states: [total_tokens, hidden_size] (packed) or
-                          [batch, seq_len, hidden_size] (padded).
-            cos, sin: RoPE embeddings.
-            cu_seqlens: Cumulative sequence lengths [batch + 1].
-            max_seqlen: Maximum sequence length.
-
-        Returns:
-            output and (key, value) for caching.
+        Handles mixed prefill + decode batches by:
+        1. Projecting all tokens together
+        2. Writing new KV to cache
+        3. Split-processing prefill and decode tokens
+        4. Concatenating outputs
         """
-        is_packed = hidden_states.dim() == 2
+        num_tokens = hidden_states.shape[0]
+        num_prefill = attn_metadata.num_prefill_tokens
+        num_decode = attn_metadata.num_decode_tokens
 
-        if is_packed:
-            total_tokens = hidden_states.shape[0]
-            # Project Q, K, V
-            q = self.q_proj(hidden_states)  # [total_tokens, num_heads * head_dim]
-            k = self.k_proj(hidden_states)  # [total_tokens, num_kv_heads * head_dim]
-            v = self.v_proj(hidden_states)
-
-            # Reshape to [total_tokens, num_heads, head_dim]
-            q = q.view(total_tokens, self.num_heads, self.head_dim)
-            k = k.view(total_tokens, self.num_kv_heads, self.head_dim)
-            v = v.view(total_tokens, self.num_kv_heads, self.head_dim)
-
-            # Apply QK-norm before RoPE
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-            # Apply RoPE
-            # For packed sequences, cos/sin should be [total_tokens, head_dim]
-            # We need to apply RoPE per-token
-            q = self._apply_rope_packed(q, cos, sin)
-            k = self._apply_rope_packed(k, cos, sin)
-
-            # FlashAttention
-            if cu_seqlens is None:
-                raise ValueError("cu_seqlens required for packed prefill")
-
-            output = flash_attention_prefill(
-                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
-            )
-
-            # Reshape output: [total_tokens, num_heads, head_dim] -> [total_tokens, hidden_size]
-            output = output.reshape(total_tokens, self.num_heads * self.head_dim)
-            output = self.o_proj(output)
-
-        else:
-            # Padded batch format
-            batch_size, seq_len, _ = hidden_states.shape
-
-            # Project
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
-
-            # Reshape to [batch, seq_len, num_heads, head_dim]
-            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-            k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-            # Apply QK-norm before RoPE
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-            # Transpose to [batch, num_heads, seq_len, head_dim]
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-            # Apply RoPE
-            q, k = apply_rope_to_qk(q, k, cos, sin)
-
-            # Expand KV heads for GQA before attention
-            # Use expand+reshape to match HF's repeat_kv memory layout
-            if self.num_heads != self.num_kv_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                k = k[:, :, None, :, :].expand(
-                    batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
-                ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-                v = v[:, :, None, :, :].expand(
-                    batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
-                ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-
-            # Use PyTorch SDPA (matches HuggingFace attention backend)
-            # Only set is_causal=True for seq_len > 1 (matching HF behavior)
-            output = F.scaled_dot_product_attention(
-                q, k, v, is_causal=(seq_len > 1),
-            )
-
-            # Reshape output: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, hidden_size]
-            output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
-            output = self.o_proj(output)
-
-            # Also reshape k, v for return
-            k = k.transpose(1, 2).reshape(batch_size, seq_len, -1)
-            v = v.transpose(1, 2).reshape(batch_size, seq_len, -1)
-
-        return output, (k, v)
-
-    def _forward_decode(
-        self,
-        hidden_states: Tensor,
-        cos: Tensor,
-        sin: Tensor,
-        k_cache: Tensor,
-        v_cache: Tensor,
-        block_tables: Tensor,
-        context_lens: Tensor,
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
-        """
-        Decode forward using PagedAttention.
-
-        Args:
-            hidden_states: [batch, 1, hidden_size] (single token per sequence).
-            cos, sin: RoPE embeddings for current positions.
-            k_cache, v_cache: Block-based KV cache.
-            block_tables: Block indices [batch, max_blocks].
-            context_lens: Number of KV tokens per sequence [batch].
-
-        Returns:
-            output and (new_key, new_value) for appending to cache.
-        """
-        batch_size = hidden_states.shape[0]
-
-        # Handle both [batch, 1, hidden] and [batch, hidden] inputs
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.squeeze(1)  # [batch, hidden_size]
-
-        # Project Q, K, V for current token
-        q = self.q_proj(hidden_states)  # [batch, num_heads * head_dim]
-        k = self.k_proj(hidden_states)  # [batch, num_kv_heads * head_dim]
+        # 1. Project all tokens
+        q = self.q_proj(hidden_states)  # [num_tokens, num_heads * head_dim]
+        k = self.k_proj(hidden_states)  # [num_tokens, num_kv_heads * head_dim]
         v = self.v_proj(hidden_states)
 
-        # Reshape
-        q = q.view(batch_size, self.num_heads, self.head_dim)
-        k = k.view(batch_size, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, self.num_kv_heads, self.head_dim)
+        # Reshape to [num_tokens, num_heads, head_dim]
+        q = q.view(num_tokens, self.num_heads, self.head_dim)
+        k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
 
-        # Apply QK-norm before RoPE
+        # 2. Apply QK-norm before RoPE
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Apply RoPE to Q and K
-        # cos, sin should be [batch, 1, head_dim] or [batch, head_dim]
-        if cos.dim() == 3:
-            cos = cos.squeeze(1)
-            sin = sin.squeeze(1)
-        # Apply: q, k are [batch, num_heads, head_dim]
-        # We need to handle this slightly differently
-        q = self._apply_rope_decode(q, cos, sin)
-        k = self._apply_rope_decode(k, cos, sin)
+        # 3. Apply RoPE
+        q, k = self._apply_rope_packed(q, k, cos, sin)
 
-        # PagedAttention
-        output = paged_attention_decode(
-            query=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_tables=block_tables,
-            context_lens=context_lens,
+        # 4. Write new KV to cache (if cache provided)
+        if kv_cache is not None and attn_metadata.slot_mapping is not None:
+            k_cache, v_cache = kv_cache
+            write_to_kv_cache(k, v, k_cache, v_cache, attn_metadata.slot_mapping)
+
+        # 5. Compute attention (split prefill and decode)
+        output = torch.empty(
+            num_tokens, self.num_heads * self.head_dim,
+            device=hidden_states.device, dtype=hidden_states.dtype
         )
 
-        # Output projection
-        output = output.reshape(batch_size, self.num_heads * self.head_dim)
-        output = self.o_proj(output)
+        if num_prefill > 0:
+            q_prefill = q[:num_prefill]
+            k_prefill = k[:num_prefill]
+            v_prefill = v[:num_prefill]
 
-        # Return output and new KV for cache update
-        # Reshape k, v back to cache format
-        return output, (k, v)
+            if attn_metadata.has_chunked_prefill and kv_cache is not None:
+                # Chunked prefill: gather cached KV + use current KV
+                output_prefill = self._attention_chunked_prefill(
+                    q_prefill, k_prefill, v_prefill, kv_cache, attn_metadata
+                )
+            else:
+                # Pure prefill: FlashAttention varlen
+                output_prefill = self._attention_pure_prefill(
+                    q_prefill, k_prefill, v_prefill, attn_metadata
+                )
+
+            output[:num_prefill] = output_prefill.view(num_prefill, -1)
+
+        if num_decode > 0:
+            q_decode = q[num_prefill:]
+
+            if kv_cache is not None:
+                k_cache, v_cache = kv_cache
+                output_decode = self._attention_decode(
+                    q_decode, k_cache, v_cache, attn_metadata
+                )
+                output[num_prefill:] = output_decode.view(num_decode, -1)
+
+        # 6. Output projection
+        return self.o_proj(output)
+
+    def _attention_pure_prefill(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> Tensor:
+        """Pure prefill using FlashAttention varlen."""
+        try:
+            output = flash_attention_prefill(
+                q, k, v,
+                attn_metadata.prefill_cu_seqlens_q,
+                attn_metadata.prefill_cu_seqlens_kv,
+                attn_metadata.max_prefill_seq_len,
+                attn_metadata.max_prefill_seq_len,
+            )
+        except Exception:
+            # Fallback to SDPA if FlashAttention not available
+            output = self._attention_prefill_sdpa(q, k, v, attn_metadata)
+
+        return output
+
+    def _attention_prefill_sdpa(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> Tensor:
+        """Prefill using PyTorch SDPA (fallback when FlashAttention unavailable)."""
+        # Process each sequence separately
+        outputs = []
+        cu_seqlens = attn_metadata.prefill_cu_seqlens_q
+
+        for i in range(attn_metadata.num_prefill_seqs):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            seq_len = end - start
+
+            q_seq = q[start:end].unsqueeze(0).transpose(1, 2)  # [1, heads, seq, dim]
+            k_seq = k[start:end].unsqueeze(0).transpose(1, 2)
+            v_seq = v[start:end].unsqueeze(0).transpose(1, 2)
+
+            # GQA expansion
+            if self.num_heads != self.num_kv_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k_seq = k_seq[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, n_rep, seq_len, self.head_dim
+                ).reshape(1, self.num_heads, seq_len, self.head_dim)
+                v_seq = v_seq[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, n_rep, seq_len, self.head_dim
+                ).reshape(1, self.num_heads, seq_len, self.head_dim)
+
+            out_seq = F.scaled_dot_product_attention(
+                q_seq, k_seq, v_seq, is_causal=(seq_len > 1)
+            )
+            out_seq = out_seq.transpose(1, 2).squeeze(0)  # [seq, heads, dim]
+            outputs.append(out_seq)
+
+        return torch.cat(outputs, dim=0)
+
+    def _attention_chunked_prefill(
+        self,
+        q: Tensor,
+        k_new: Tensor,
+        v_new: Tensor,
+        kv_cache: Tuple[Tensor, Tensor],
+        attn_metadata: "AttentionMetadata",
+    ) -> Tensor:
+        """
+        Chunked prefill: Q attends to cached KV + new KV.
+
+        For each sequence:
+        1. Gather cached KV from paged cache
+        2. Concatenate with new KV
+        3. Run attention (SDPA)
+        """
+        k_cache, v_cache = kv_cache
+        outputs = []
+
+        cu_seqlens_q = attn_metadata.prefill_cu_seqlens_q
+        context_lens = attn_metadata.prefill_context_lens
+        block_tables = attn_metadata.prefill_block_tables
+
+        for i in range(attn_metadata.num_prefill_seqs):
+            q_start = cu_seqlens_q[i].item()
+            q_end = cu_seqlens_q[i + 1].item()
+            query_len = q_end - q_start
+            ctx_len = context_lens[i].item()
+
+            q_seq = q[q_start:q_end]  # [query_len, heads, dim]
+            k_seq_new = k_new[q_start:q_end]
+            v_seq_new = v_new[q_start:q_end]
+
+            if ctx_len > 0 and block_tables is not None:
+                # Gather cached KV
+                k_cached, v_cached = self._gather_seq_kv(
+                    k_cache, v_cache, block_tables[i], ctx_len
+                )
+                # Concat: [cached_len + query_len, kv_heads, dim]
+                k_seq = torch.cat([k_cached, k_seq_new], dim=0)
+                v_seq = torch.cat([v_cached, v_seq_new], dim=0)
+            else:
+                k_seq = k_seq_new
+                v_seq = v_seq_new
+
+            total_len = k_seq.shape[0]
+
+            # Reshape for SDPA: [1, heads, seq, dim]
+            q_seq = q_seq.unsqueeze(0).transpose(1, 2)
+            k_seq = k_seq.unsqueeze(0).transpose(1, 2)
+            v_seq = v_seq.unsqueeze(0).transpose(1, 2)
+
+            # GQA expansion
+            if self.num_heads != self.num_kv_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k_seq = k_seq[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, n_rep, total_len, self.head_dim
+                ).reshape(1, self.num_heads, total_len, self.head_dim)
+                v_seq = v_seq[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, n_rep, total_len, self.head_dim
+                ).reshape(1, self.num_heads, total_len, self.head_dim)
+
+            # Build causal mask for chunked attention
+            # Q can only attend to positions <= its position in the full sequence
+            # Q positions: [ctx_len, ctx_len+1, ..., ctx_len+query_len-1]
+            # K positions: [0, 1, ..., total_len-1]
+            attn_mask = self._build_chunked_causal_mask(query_len, total_len, ctx_len, q.device)
+
+            out_seq = F.scaled_dot_product_attention(
+                q_seq, k_seq, v_seq, attn_mask=attn_mask
+            )
+            out_seq = out_seq.transpose(1, 2).squeeze(0)  # [query_len, heads, dim]
+            outputs.append(out_seq)
+
+        return torch.cat(outputs, dim=0)
+
+    def _attention_decode(
+        self,
+        q: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> Tensor:
+        """Decode using PagedAttention."""
+        # q: [num_decode, num_heads, head_dim]
+        return paged_attention_decode(
+            q,
+            k_cache,
+            v_cache,
+            attn_metadata.decode_block_tables,
+            attn_metadata.decode_seq_lens,
+        )
+
+    def _gather_seq_kv(
+        self,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        block_table: Tensor,
+        context_len: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """Gather KV for a single sequence from paged cache."""
+        block_size = k_cache.shape[1]
+        num_full_blocks = context_len // block_size
+        remaining = context_len % block_size
+
+        k_parts = []
+        v_parts = []
+
+        for b in range(num_full_blocks):
+            block_idx = block_table[b].item()
+            k_parts.append(k_cache[block_idx])
+            v_parts.append(v_cache[block_idx])
+
+        if remaining > 0:
+            block_idx = block_table[num_full_blocks].item()
+            k_parts.append(k_cache[block_idx, :remaining])
+            v_parts.append(v_cache[block_idx, :remaining])
+
+        return torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0)
+
+    def _build_chunked_causal_mask(
+        self,
+        query_len: int,
+        kv_len: int,
+        context_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        """
+        Build causal mask for chunked prefill.
+
+        Q positions: [context_len, context_len+1, ..., context_len+query_len-1]
+        K positions: [0, 1, ..., kv_len-1]
+
+        Q[i] can attend to K[j] iff j <= context_len + i
+        """
+        # Q absolute positions
+        q_pos = torch.arange(context_len, context_len + query_len, device=device)
+        # K positions
+        k_pos = torch.arange(kv_len, device=device)
+
+        # Causal: q_pos[i] >= k_pos[j]
+        mask = q_pos.unsqueeze(1) >= k_pos.unsqueeze(0)  # [query_len, kv_len]
+
+        # Convert to attention mask (0 = attend, -inf = mask)
+        attn_mask = torch.zeros(query_len, kv_len, device=device, dtype=torch.float32)
+        attn_mask.masked_fill_(~mask, float("-inf"))
+
+        return attn_mask
 
     def _apply_rope_packed(
-        self, x: Tensor, cos: Tensor, sin: Tensor
-    ) -> Tensor:
+        self,
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         """Apply RoPE for packed sequences."""
-        # x: [total_tokens, num_heads, head_dim]
-        # cos, sin: [total_tokens, head_dim] or similar
+        # q, k: [total_tokens, num_heads, head_dim]
+        # cos, sin: [total_tokens, head_dim] or [total_tokens, 1, head_dim]
 
-        # Ensure cos/sin are broadcastable
         if cos.dim() == 2:
             cos = cos.unsqueeze(1)  # [total_tokens, 1, head_dim]
             sin = sin.unsqueeze(1)
 
         # Split and rotate
-        x1 = x[..., : self.head_dim // 2]
-        x2 = x[..., self.head_dim // 2 :]
-        rotated = torch.cat([-x2, x1], dim=-1)
+        q1 = q[..., : self.head_dim // 2]
+        q2 = q[..., self.head_dim // 2:]
+        q_rotated = torch.cat([-q2, q1], dim=-1)
+        q_out = q * cos + q_rotated * sin
 
-        return x * cos + rotated * sin
+        k1 = k[..., : self.head_dim // 2]
+        k2 = k[..., self.head_dim // 2:]
+        k_rotated = torch.cat([-k2, k1], dim=-1)
+        k_out = k * cos[:, :self.num_kv_heads, :] if cos.shape[1] > 1 else k * cos + k_rotated * sin
 
-    def _apply_rope_decode(
-        self, x: Tensor, cos: Tensor, sin: Tensor
+        # Actually apply to k properly
+        k_out = k * cos + k_rotated * sin
+
+        return q_out, k_out
+
+    def _forward_legacy_prefill(
+        self,
+        hidden_states: Tensor,
+        cos: Tensor,
+        sin: Tensor,
     ) -> Tensor:
-        """Apply RoPE for decode (single position)."""
-        # x: [batch, num_heads, head_dim]
-        # cos, sin: [batch, head_dim]
+        """
+        Legacy pure prefill mode (for backward compatibility and HF comparison).
 
-        # Expand for broadcasting
-        if cos.dim() == 2:
-            cos = cos.unsqueeze(1)  # [batch, 1, head_dim]
-            sin = sin.unsqueeze(1)
+        Handles both packed [total_tokens, hidden] and batched [batch, seq, hidden].
+        """
+        is_packed = hidden_states.dim() == 2
 
-        # Split and rotate
-        x1 = x[..., : self.head_dim // 2]
-        x2 = x[..., self.head_dim // 2 :]
-        rotated = torch.cat([-x2, x1], dim=-1)
+        if is_packed:
+            return self._forward_legacy_packed(hidden_states, cos, sin)
+        else:
+            return self._forward_legacy_batched(hidden_states, cos, sin)
 
-        return x * cos + rotated * sin
+    def _forward_legacy_packed(
+        self,
+        hidden_states: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tensor:
+        """Legacy packed prefill."""
+        total_tokens = hidden_states.shape[0]
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(total_tokens, self.num_heads, self.head_dim)
+        k = k.view(total_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q, k = self._apply_rope_packed(q, k, cos, sin)
+
+        # Use SDPA for single sequence
+        q = q.unsqueeze(0).transpose(1, 2)  # [1, heads, seq, dim]
+        k = k.unsqueeze(0).transpose(1, 2)
+        v = v.unsqueeze(0).transpose(1, 2)
+
+        # GQA expansion
+        if self.num_heads != self.num_kv_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = k[:, :, None, :, :].expand(
+                1, self.num_kv_heads, n_rep, total_tokens, self.head_dim
+            ).reshape(1, self.num_heads, total_tokens, self.head_dim)
+            v = v[:, :, None, :, :].expand(
+                1, self.num_kv_heads, n_rep, total_tokens, self.head_dim
+            ).reshape(1, self.num_heads, total_tokens, self.head_dim)
+
+        output = F.scaled_dot_product_attention(q, k, v, is_causal=(total_tokens > 1))
+        output = output.transpose(1, 2).squeeze(0)  # [seq, heads, dim]
+        output = output.reshape(total_tokens, -1)
+
+        return self.o_proj(output)
+
+    def _forward_legacy_batched(
+        self,
+        hidden_states: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tensor:
+        """Legacy batched prefill (for HF comparison)."""
+        batch_size, seq_len, _ = hidden_states.shape
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)  # [batch, heads, seq, dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q, k = apply_rope_to_qk(q, k, cos, sin)
+
+        # GQA expansion
+        if self.num_heads != self.num_kv_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = k[:, :, None, :, :].expand(
+                batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
+            ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+            v = v[:, :, None, :, :].expand(
+                batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim
+            ).reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+
+        output = F.scaled_dot_product_attention(q, k, v, is_causal=(seq_len > 1))
+        output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+
+        return self.o_proj(output)

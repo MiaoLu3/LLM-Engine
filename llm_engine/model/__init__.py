@@ -24,7 +24,16 @@ from llm_engine.model.attention import (
     flash_attention_prefill,
     paged_attention_decode,
     naive_attention,
+    write_to_kv_cache,
+    gather_from_kv_cache,
     Qwen3Attention,
+)
+from llm_engine.model.attention_metadata import (
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    create_empty_metadata,
+    create_prefill_metadata,
+    create_decode_metadata,
 )
 from llm_engine.model.qwen3 import (
     Qwen3Config,
@@ -58,7 +67,15 @@ __all__ = [
     "flash_attention_prefill",
     "paged_attention_decode",
     "naive_attention",
+    "write_to_kv_cache",
+    "gather_from_kv_cache",
     "Qwen3Attention",
+    # Attention Metadata
+    "AttentionMetadata",
+    "AttentionMetadataBuilder",
+    "create_empty_metadata",
+    "create_prefill_metadata",
+    "create_decode_metadata",
     # Qwen3 Model
     "Qwen3Config",
     "Qwen3Model",
