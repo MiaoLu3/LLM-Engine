@@ -15,8 +15,8 @@ A minimal LLM serving engine built from scratch, implementing core vLLM concepts
 | Foundation | 1-3 | Completed |
 | Custom Model | 3.5a-f | Completed & Validated |
 | Unified Attention | 3.6 | Completed (Option C) |
-| KV Cache | 4a-b | Pending |
-| Scheduling | 5-6 | Pending |
+| KV Cache | 4a-b | Completed |
+| Scheduling | 5-6 | Next |
 | API & Features | 7-10 | Pending |
 | Production | 11-12 | Pending |
 
@@ -183,49 +183,56 @@ def forward(hidden_states, position_embeddings, kv_cache, attn_metadata):
 
 ---
 
-## Phase 3: KV Cache (Next)
+## Phase 3: KV Cache (Completed)
 
 ### Step 4a: KVCache Tensor Allocation
-**Status:** Pending
+**Status:** Completed
 
-Create GPU tensors for storing K/V across all layers:
+**File:** `llm_engine/memory/kv_cache.py`
 
-```python
-class KVCache:
-    """
-    Block-based KV cache storage.
+GPU tensor allocation for K/V across all layers:
 
-    Shape per layer: [num_blocks, block_size, num_kv_heads, head_dim]
-    """
-    def __init__(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype):
-        self.k_cache = [torch.zeros(...) for _ in range(num_layers)]
-        self.v_cache = [torch.zeros(...) for _ in range(num_layers)]
+| Class/Function | Description |
+|----------------|-------------|
+| `KVCacheConfig` | Configuration dataclass |
+| `KVCache` | Block-based cache storage |
+| `create_kv_cache()` | Convenience constructor |
+| `compute_slot_mapping()` | Compute write positions |
 
-    def get_layer_cache(self, layer_idx) -> Tuple[Tensor, Tensor]:
-        return (self.k_cache[layer_idx], self.v_cache[layer_idx])
+**Cache Layout:**
 ```
+k_cache[layer]: [num_blocks, block_size, num_kv_heads, head_dim]
+v_cache[layer]: [num_blocks, block_size, num_kv_heads, head_dim]
+```
+
+**Key Methods:**
+- `get_layer_cache(layer_idx)` → (k_cache, v_cache)
+- `get_all_layer_caches()` → List of (k, v) per layer
+- `copy_blocks(src_to_dst)` → Copy-on-write support
+- `clear_blocks(block_ids)` → Zero specific blocks
 
 ### Step 4b: BlockManager
-**Status:** Pending
+**Status:** Completed
 
-Manage block allocation and deallocation:
+**File:** `llm_engine/memory/block_manager.py`
 
-```python
-class BlockManager:
-    """
-    Manages physical block allocation for sequences.
+Manages physical block allocation for sequences:
 
-    Features:
-    - Allocate blocks for new sequences
-    - Free blocks when sequences complete
-    - Copy-on-write for beam search / prefix sharing
-    - Compute slot_mapping for KV cache writes
-    """
-    def allocate(self, seq_id: int, num_blocks: int) -> List[int]
-    def free(self, seq_id: int) -> None
-    def fork(self, src_seq_id: int, dst_seq_id: int) -> None  # CoW
-    def get_slot_mapping(self, seq_id: int, positions: List[int]) -> List[int]
-```
+| Class/Function | Description |
+|----------------|-------------|
+| `BlockManagerConfig` | Configuration dataclass |
+| `BlockManager` | Block allocation manager |
+| `create_block_manager()` | Convenience constructor |
+
+**Key Methods:**
+- `allocate_sequence(seq_id, num_tokens)` → Allocate blocks for prefill
+- `allocate_token(seq_id)` → Allocate for decode (1 token)
+- `free_sequence(seq_id)` → Free all blocks
+- `fork_sequence(src, dst)` → Copy-on-write fork
+- `copy_on_write(seq_id, block_idx)` → Duplicate shared block
+- `get_slot_mapping(seq_id, context_len, num_new_tokens)` → Cache write positions
+- `get_block_table(seq_id)` → Physical block IDs
+- `can_allocate(num_blocks)` → Check memory availability
 
 ---
 
@@ -348,32 +355,34 @@ class AsyncLLMEngine:
 llm-engine/
 ├── llm_engine/
 │   ├── __init__.py
-│   ├── config.py              # ModelConfig, SamplingParams
+│   ├── config.py              # ModelConfig, SamplingParams ✓
 │   ├── data_structures/
-│   │   ├── sequence.py        # Sequence, SequenceGroup
-│   │   └── block.py           # Block, BlockTable
+│   │   ├── sequence.py        # Sequence, SequenceGroup ✓
+│   │   └── block.py           # Block, BlockTable ✓
 │   ├── model/
-│   │   ├── rope.py            # Rotary position embeddings
-│   │   ├── layers.py          # RMSNorm, MLP
-│   │   ├── attention.py       # Unified attention (prefill/decode)
-│   │   ├── attention_metadata.py  # AttentionMetadata for unified forward
-│   │   ├── qwen3.py           # Full Qwen3 model
-│   │   ├── loader.py          # Weight loading
-│   │   └── executor.py        # Model execution
-│   ├── memory/                 # Step 4: KV Cache
-│   │   ├── kv_cache.py
-│   │   └── block_manager.py
-│   ├── scheduler/              # Step 5-6
+│   │   ├── rope.py            # Rotary position embeddings ✓
+│   │   ├── layers.py          # RMSNorm, MLP ✓
+│   │   ├── attention.py       # Unified attention (prefill/decode) ✓
+│   │   ├── attention_metadata.py  # AttentionMetadata ✓
+│   │   ├── qwen3.py           # Full Qwen3 model ✓
+│   │   ├── loader.py          # Weight loading ✓
+│   │   └── executor.py        # Model execution ✓
+│   ├── memory/                 # Step 4: KV Cache ✓
+│   │   ├── kv_cache.py        # KVCache, KVCacheConfig ✓
+│   │   └── block_manager.py   # BlockManager ✓
+│   ├── scheduler/              # Step 5-6 (pending)
 │   │   └── scheduler.py
 │   ├── sampling/
-│   │   └── sampler.py
-│   └── engine/                 # Steps 7-11
+│   │   └── sampler.py         # Sampler ✓
+│   └── engine/                 # Steps 7-11 (pending)
 │       ├── llm_engine.py
 │       ├── async_engine.py
-│       └── output.py
+│       └── output.py          # RequestOutput ✓
 ├── tests/
 ├── scripts/
-│   └── compare_models.py      # HF comparison script
+│   ├── compare_models.py      # HF comparison ✓
+│   ├── test_unified_prefill.py  # Unified attention test ✓
+│   └── test_kv_cache.py       # KVCache/BlockManager test ✓
 └── docs/
     ├── implementation-plan.md
     ├── qwen3-architecture.md
